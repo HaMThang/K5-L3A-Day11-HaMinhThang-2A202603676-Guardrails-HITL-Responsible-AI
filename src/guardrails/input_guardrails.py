@@ -10,7 +10,11 @@ Status convention (không dùng True/False mơ hồ):
 """
 from __future__ import annotations
 
+import base64
+import binascii
+import codecs
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -21,6 +25,144 @@ from core.config import ALLOWED_TOPICS, BLOCKED_TOPICS
 
 # Quyết định rõ ràng — tránh đảo nghĩa True/False
 InputStatus = Literal["ALLOW", "BLOCK"]
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize Unicode tricks while preserving meaningful word boundaries."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    normalized = "".join(
+        "" if unicodedata.category(char) == "Cf" else char
+        for char in normalized
+    )
+    normalized = unicodedata.normalize("NFKD", normalized)
+    normalized = "".join(
+        char for char in normalized if unicodedata.category(char) != "Mn"
+    )
+    normalized = normalized.replace("đ", "d").replace("Đ", "D")
+    return re.sub(r"\s+", " ", normalized).strip().lower()
+
+
+_INJECTION_PATTERNS = (
+    re.compile(
+        r"\bignore\s+(?:all\s+)?(?:(?:previous|above|prior|earlier)\s+)?instructions?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:disregard|forget|override|bypass)\s+(?:(?:all|the)\s+)?"
+        r"(?:(?:previous|above|prior|system|safety)\s+)?"
+        r"(?:instructions?|rules?|guardrails?|policies?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\byou\s+are\s+now\b", re.IGNORECASE),
+    re.compile(r"\bsystem\s+prompt\b", re.IGNORECASE),
+    re.compile(r"\breveal\s+(?:your\s+)?(?:instructions?|prompt)\b", re.IGNORECASE),
+    re.compile(r"\bpretend\s+(?:that\s+)?you\s+are\b", re.IGNORECASE),
+    re.compile(
+        r"\bact\s+as\s+(?:(?:an?|the)\s+)?unrestricted\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bdo\s+anything\s+now\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:enable|enter|switch\s+to)\s+(?:developer|jailbreak)\s+mode\b",
+        re.IGNORECASE,
+    ),
+)
+
+_TOXIC_PATTERNS = (
+    re.compile(r"\b(?:fuck(?:ing|ed|er)?|shit|bitch|asshole|idiot)\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:ngu|ngoc|do ngu|thang ngu|con ngu|oc cho|oc lon|oc heo|"
+        r"oc ba dau|do oc|dit me|du me|dcm|dmm|con cho|vai lon|vcl)\b",
+        re.IGNORECASE,
+    ),
+)
+
+
+def detect_toxicity(user_input: str) -> InputStatus:
+    """Block common profanity and direct insults in English and Vietnamese."""
+    normalized_input = _normalize_text(user_input)
+    if any(pattern.search(normalized_input) for pattern in _TOXIC_PATTERNS):
+        return "BLOCK"
+    return "ALLOW"
+
+
+_BALANCE_OPERATION = re.compile(
+    r"\b(?:chuyen(?:\s+khoan|\s+tien)?|rut\s+tien|thanh\s+toan|"
+    r"nap\s+tien|gui\s+tien|transfer|send\s+money|withdraw|pay|"
+    r"make\s+(?:a\s+)?payment)\b",
+    re.IGNORECASE,
+)
+_BALANCE_ACTION_INTENT = re.compile(
+    r"\b(?:toi\s+muon|toi\s+can|hay|vui\s+long|giup\s+toi|thuc\s+hien|"
+    r"i\s+want\s+to|i\s+need\s+to|please|can\s+you|could\s+you|execute)\b",
+    re.IGNORECASE,
+)
+_HACKING_PATTERNS = re.compile(
+    r"\b(?:hack(?:ing|ed|er)?|exploit(?:ation)?|intrusion|intrude|breach|"
+    r"phishing|malware|xss|sql injection|remote code execution|privilege escalation|"
+    r"unauthori[sz]ed access|bypass(?:ing)? authentication|credential theft|"
+    r"credential stuffing|port scanning|exfiltrat\w*|xam nhap|tan cong|"
+    r"chiem quyen|be khoa|ma doc|danh cap|lo hong|quet cong)\b",
+    re.IGNORECASE,
+)
+
+
+def _decoded_text_variants(text: str) -> list[str]:
+    """Return bounded plain/encoded text candidates for defensive inspection."""
+    normalized = _normalize_text(text)
+    variants = [normalized, codecs.decode(normalized, "rot_13"), normalized[::-1]]
+
+    def add_utf8_candidate(raw: bytes) -> None:
+        if not raw or len(raw) > 4096:
+            return
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        printable = sum(char.isprintable() or char in "\r\n\t" for char in decoded)
+        if decoded and printable / len(decoded) >= 0.85:
+            variants.append(_normalize_text(decoded))
+
+    encoded_tokens = set(re.findall(r"[A-Za-z0-9+/_=-]{8,}", text or ""))
+    for token in encoded_tokens:
+        if len(token) > 4096:
+            continue
+
+        base64_token = token.translate(str.maketrans("-_", "+/"))
+        base64_token += "=" * (-len(base64_token) % 4)
+        try:
+            add_utf8_candidate(base64.b64decode(base64_token, validate=True))
+        except (binascii.Error, ValueError):
+            pass
+
+        if len(token) >= 12 and len(token) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", token):
+            try:
+                add_utf8_candidate(bytes.fromhex(token))
+            except ValueError:
+                pass
+
+    return variants
+
+
+def detect_hacking_intent(user_input: str) -> InputStatus:
+    """Block plain or commonly encoded requests involving hacking/intrusion."""
+    return "BLOCK" if any(
+        _HACKING_PATTERNS.search(candidate)
+        for candidate in _decoded_text_variants(user_input)
+    ) else "ALLOW"
+
+
+def detect_balance_action(user_input: str) -> InputStatus:
+    """Block explicit balance-changing requests with transaction details."""
+    normalized_input = _normalize_text(user_input)
+    if not _BALANCE_OPERATION.search(normalized_input):
+        return "ALLOW"
+
+    long_numbers = re.findall(r"(?<!\d)\d[\d,._]{3,}\d(?!\d)", normalized_input)
+    explicit_intent = _BALANCE_ACTION_INTENT.search(normalized_input)
+    if len(long_numbers) >= 2 or (explicit_intent and long_numbers):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -51,14 +193,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    normalized_input = _normalize_text(user_input)
+    for pattern in _INJECTION_PATTERNS:
+        if pattern.search(normalized_input):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +221,23 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    normalized_input = _normalize_text(user_input)
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    if detect_hacking_intent(user_input) == "BLOCK":
+        return "BLOCK"
 
-    pass  # Replace with your implementation
+    def contains_topic(topic: str) -> bool:
+        words = _normalize_text(topic).split()
+        if not words:
+            return False
+        topic_pattern = r"(?<!\w)" + r"\s+".join(map(re.escape, words)) + r"(?!\w)"
+        return re.search(topic_pattern, normalized_input) is not None
+
+    if any(contains_topic(topic) for topic in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(contains_topic(topic) for topic in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +290,39 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Yêu cầu bị chặn do phát hiện dấu hiệu prompt injection. "
+                "Vui lòng chỉ hỏi về dịch vụ VinBank."
+            )
 
-        pass  # Replace with your implementation
+        if detect_toxicity(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Tin nhắn bị chặn. Vui lòng giữ lời lẽ tôn trọng trong hội thoại."
+            )
+
+        if detect_balance_action(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Chatbot không được phép thao tác làm thay đổi số dư tài khoản. "
+                "Vui lòng tự xác nhận giao dịch trong ứng dụng hoặc kênh chính thức của ngân hàng."
+            )
+
+        if detect_hacking_intent(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Yêu cầu hack hoặc xâm nhập bị chặn. Trợ lý chỉ hỗ trợ dịch vụ ngân hàng."
+            )
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Trợ lý chỉ hỗ trợ các chủ đề dịch vụ ngân hàng."
+            )
+
+        return None
 
 
 # ============================================================

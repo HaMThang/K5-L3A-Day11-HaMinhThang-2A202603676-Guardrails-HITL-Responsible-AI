@@ -12,7 +12,9 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
+from guardrails.input_guardrails import detect_toxicity
 
 
 # ============================================================
@@ -24,7 +26,8 @@ from core.utils import chat_with_agent
 # Return a dict with:
 # - "safe": True/False
 # - "issues": list of problems found
-# - "redacted": cleaned response (PII replaced with [REDACTED])
+# - "redacted": contract-compatible response (PII replaced with [REDACTED])
+# - "masked": display response (sensitive spans replaced with asterisks)
 # ============================================================
 
 def content_filter(response: str) -> dict:
@@ -37,28 +40,53 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
-
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+    redacted = response or ""
+    masked = response or ""
+    pii_patterns = {
+        "phone_number": r"(?<!\d)(?:\+?84|0)(?:[\s().-]?\d){9,10}(?!\d)",
+        "email": r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+        "api_key": r"\bsk-[A-Z0-9_-]{4,}\b",
+        "password": (
+            r"\b(?:admin\s+)?password\s*(?:is|[:=])\s*"
+            r"[\"']?[^\s,;.!?\"']+"
+        ),
+        "internal_host": (
+            r"\b(?:[A-Z0-9-]+\.)+(?:internal|local)"
+            r"(?::\d{1,5})?(?![\w:-])"
+        ),
     }
 
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    for name, pattern in pii_patterns.items():
+        matches = list(re.finditer(pattern, response or "", re.IGNORECASE))
         if matches:
             issues.append(f"{name}: {len(matches)} found")
             redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            masked = re.sub(
+                pattern,
+                lambda match: "*" * len(match.group(0)),
+                masked,
+                flags=re.IGNORECASE,
+            )
+
+    for secret in DEMO_SECRETS:
+        if secret and re.search(re.escape(secret), response or "", re.IGNORECASE):
+            issues.append("protected_secret: 1 found")
+            redacted = re.sub(
+                re.escape(secret), "[REDACTED]", redacted, flags=re.IGNORECASE
+            )
+            masked = re.sub(
+                re.escape(secret),
+                lambda match: "*" * len(match.group(0)),
+                masked,
+                flags=re.IGNORECASE,
+            )
 
     return {
         "safe": len(issues) == 0,
         "issues": issues,
         "redacted": redacted,
+        "masked": masked,
     }
 
 
@@ -149,6 +177,7 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+        self.last_issues: list[str] = []
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -167,21 +196,49 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
     ):
         """Check LLM response before sending to user."""
         self.total_count += 1
+        self.last_issues = []
 
         response_text = self._extract_text(llm_response)
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        if detect_toxicity(response_text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_issues = ["toxic_language"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[
+                    types.Part.from_text(
+                        text="Phản hồi bị chặn. Vui lòng giữ lời lẽ tôn trọng trong hội thoại."
+                    )
+                ],
+            )
+            return llm_response
 
-        return llm_response  # TODO: modify if needed
+        filtered = content_filter(response_text)
+        self.last_issues = list(filtered["issues"])
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filtered["masked"])],
+            )
+
+        if self.use_llm_judge:
+            judge_result = await llm_safety_check(filtered["redacted"])
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                self.last_issues.append("judge_rejected_response")
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[
+                        types.Part.from_text(
+                            text="Phản hồi đã bị lớp bảo vệ nội dung chặn."
+                        )
+                    ],
+                )
+
+        return llm_response
 
 
 # ============================================================
